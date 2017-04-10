@@ -6,32 +6,46 @@
     """
 import numpy as np
 import cPickle as pickle
-import gym
-import time
-import copy
-#from multiprocessing import Process
-import threading
+import gym, time, copy, argparse, threading, sys
 
 # hyperparameters
 H = 200 # number of hidden layer neurons
-batch_size = 8 # every how many episodes to do a param update? We will use this to do multiple runs
+D = 80 * 80 # input dimensionality: 80x80 grid
 learning_rate = 1e-3
 gamma = 0.99 # discount factor for reward
 decay_rate = 0.99 # decay factor for RMSProp leaky sum of grad^2
 total_wins = 0
+grad_buffer = {}
+rmsprop_cache = {}
+model = {}
 
-# model initialization
-D = 80 * 80 # input dimensionality: 80x80 grid
-try:
-  model = pickle.load(open('saveM.p', 'rb'))
-  print('Loaded saved model')
-except:
-  model = {}
-  model['W1'] = np.random.randn(H,D) / np.sqrt(D) # "Xavier" initialization
-  model['W2'] = np.random.randn(H) / np.sqrt(H)
-  
-grad_buffer = { k : np.zeros_like(v) for k,v in model.iteritems() } # update buffers that add up gradients over a batch
-rmsprop_cache = { k : np.zeros_like(v) for k,v in model.iteritems() } # rmsprop memory
+# Parameter class
+class Args(object):
+    threads = 8
+    games_per_thread = 4
+    paramsFile = 'saveM.p'
+
+args = Args()
+env = gym.make("Pong-v0")
+
+def init_model():
+    global model, grad_buffer, rmsprop_cache, H, D
+    # model initialization
+    try:
+      model = pickle.load(open(args.paramsFile, 'rb'))
+      print('Loaded saved model')
+    except:
+      model = {}
+      model['W1'] = np.random.randn(H,D) / np.sqrt(D) # "Xavier" initialization
+      model['W2'] = np.random.randn(H) / np.sqrt(H)
+      print('Created new model')      
+      
+    grad_buffer = { k : np.zeros_like(v) for k,v in model.iteritems() } # update buffers that add up gradients over a batch
+    rmsprop_cache = { k : np.zeros_like(v) for k,v in model.iteritems() } # rmsprop memory
+
+def save_model():
+    pickle.dump(model, open(args.paramsFile, 'wb'))
+    print('saved model parameters')
 
 def sigmoid(x): 
   return 1.0 / (1.0 + np.exp(-x)) # sigmoid "squashing" function to interval [0,1]
@@ -77,102 +91,117 @@ def one_run(env, idx):
   """ Do one game set of play and learn from it """
   global grad_buffer, total_wins, model
   try:
-    observation = env.reset()
-    prev_x = None # used in computing the difference frame
-    xs,hs,dlogps,drs = [],[],[],[]
-    reward_sum = 0
-    done = False
-    #print('Started thread %d' % idx)
-    while not done:
-      # preprocess the observation, set input to network to be difference image
-      cur_x = prepro(observation)
-      x = cur_x - prev_x if prev_x is not None else np.zeros(D)
-      prev_x = cur_x
+    for i in range(1, args.games_per_thread):
+        observation = env.reset()
+        prev_x = None # used in computing the difference frame
+        xs,hs,dlogps,drs = [],[],[],[]
+        reward_sum = 0
+        done = False
+        #print('Started thread %d' % idx)
+        while not done:
+          # preprocess the observation, set input to network to be difference image
+          cur_x = prepro(observation)
+          x = cur_x - prev_x if prev_x is not None else np.zeros(D)
+          prev_x = cur_x
 
-      # forward the policy network and sample an action from the returned probability
-      aprob, h = policy_forward(x)
-      action = 2 if np.random.uniform() < aprob else 3 # roll the dice!
+          # forward the policy network and sample an action from the returned probability
+          aprob, h = policy_forward(x)
+          action = 2 if np.random.uniform() < aprob else 3 # roll the dice!
 
-      # record various intermediates (needed later for backprop)
-      xs.append(x) # observation
-      hs.append(h) # hidden state
-      y = 1 if action == 2 else 0 # a "fake label"
-      dlogps.append(y - aprob) # grad that encourages the action that was taken to be taken (see http://cs231n.github.io/neural-networks-2/#losses if confused)
+          # record various intermediates (needed later for backprop)
+          xs.append(x) # observation
+          hs.append(h) # hidden state
+          y = 1 if action == 2 else 0 # a "fake label"
+          dlogps.append(y - aprob) # grad that encourages the action that was taken to be taken (see http://cs231n.github.io/neural-networks-2/#losses if confused)
 
-      # step the environment and get new measurements
-      observation, reward, done, info = env.step(action)
-      reward_sum += reward
+          # step the environment and get new measurements
+          observation, reward, done, info = env.step(action)
+          reward_sum += reward
 
-      drs.append(reward) # record reward (has to be done after we call step() to get reward for previous action)
-      
-    # stack together all inputs, hidden states, action gradients, and rewards for this episode
-    epx = np.vstack(xs)
-    eph = np.vstack(hs)
-    epdlogp = np.vstack(dlogps)
-    epr = np.vstack(drs)
+          drs.append(reward) # record reward (has to be done after we call step() to get reward for previous action)
+          
+        # stack together all inputs, hidden states, action gradients, and rewards for this episode
+        epx = np.vstack(xs)
+        eph = np.vstack(hs)
+        epdlogp = np.vstack(dlogps)
+        epr = np.vstack(drs)
 
-    # compute the discounted reward backwards through time
-    discounted_epr = discount_rewards(epr)
-    # standardize the rewards to be unit normal (helps control the gradient estimator variance)
-    discounted_epr -= np.mean(discounted_epr)
-    discounted_epr /= np.std(discounted_epr)
+        # compute the discounted reward backwards through time
+        discounted_epr = discount_rewards(epr)
+        # standardize the rewards to be unit normal (helps control the gradient estimator variance)
+        discounted_epr -= np.mean(discounted_epr)
+        discounted_epr /= np.std(discounted_epr)
 
-    epdlogp *= discounted_epr # modulate the gradient with advantage (PG magic happens right here.)
-    grad = policy_backward(epx, eph, epdlogp)
-    lock = threading.Lock()
-    lock.acquire()
-    for k in model: grad_buffer[k] += grad[k] # accumulate grad over batch
-    total_wins += 21 + reward_sum
-    lock.release()
-    #print('Done with thread %d' % idx)
+        epdlogp *= discounted_epr # modulate the gradient with advantage (PG magic happens right here.)
+        grad = policy_backward(epx, eph, epdlogp)
+        lock = threading.Lock()
+        lock.acquire()
+        for k in model: grad_buffer[k] += grad[k] # accumulate grad over batch
+        total_wins += 21 + reward_sum
+        lock.release()
+        #print('Done with thread %d' % idx)
   except KeyboardInterrupt:
     raise
   
-env = gym.make("Pong-v0")
-last = time.time()
-episodes = 0
-while True:
-  try:
-    thread_list = []
-    #print('*************Start %d threads' % batch_size)
-    for i in range(0, batch_size):
-      t = threading.Thread(target=one_run, args=(copy.deepcopy(env),i))
-      thread_list.append(t)
-      t.start()
-      
-    #print('Wait for %d threads' % batch_size)
-    #Wait for all threads to finish
-    for t in thread_list:
-      #print('Joining thread %s' % t.getName())
-      #if(t.is_alive()):
-      t.join()
+def train_agent():
+    global model, total_wins, env
+    last = time.time()
+    episodes = 0
+    init_model()
+    while True:
+      try:
+        thread_list = []
+        #print('*************Start %d threads' % args.threads)
+        for i in range(0, args.threads):
+          t = threading.Thread(target=one_run, args=(copy.deepcopy(env),i))
+          thread_list.append(t)
+          t.start()
+          
+        #print('Wait for %d threads' % args.threads)
+        #Wait for all threads to finish
+        for t in thread_list:
+          #print('Joining thread %s' % t.getName())
+          #if(t.is_alive()):
+          t.join()
 
-    #print('Done waiting for %d threads' % batch_size)
-    for t in thread_list:
-      if(t.is_alive()):
-        print('Thread %s is still alive' % t.getName())
-        raise KeyboardInterrupt
-      
-    episodes += batch_size
-    for k,v in model.iteritems():
-      g = grad_buffer[k] # gradient
-      rmsprop_cache[k] = decay_rate * rmsprop_cache[k] + (1 - decay_rate) * g**2
-      model[k] += learning_rate * g / (np.sqrt(rmsprop_cache[k]) + 1e-5)
-      grad_buffer[k] = np.zeros_like(v) # reset batch gradient buffer
+        #print('Done waiting for %d threads' % args.threads)
+        for t in thread_list:
+          if(t.is_alive()):
+            print('Thread %s is still alive' % t.getName())
+            raise KeyboardInterrupt
+          
+        episodes += args.threads * args.games_per_thread
+        for k,v in model.iteritems():
+          g = grad_buffer[k] # gradient
+          rmsprop_cache[k] = decay_rate * rmsprop_cache[k] + (1 - decay_rate) * g**2
+          model[k] += learning_rate * g / (np.sqrt(rmsprop_cache[k]) + 1e-5)
+          grad_buffer[k] = np.zeros_like(v) # reset batch gradient buffer
 
-    # boring book-keeping
-    end = time.time()
-    print('episodes: %d, Av wins: %.2f, Ave time: %f ******' %
-          (episodes, total_wins/batch_size, (end-last)/batch_size))
-    last = end
-    total_wins = 0
-    if episodes % 7 == 0:
-      pickle.dump(model, open('saveM.p', 'wb'))
-      print('saved multi-model')
+        # boring book-keeping
+        end = time.time()
+        print('episodes: %d, Av wins: %.2f, Ave time: %f ******' %
+              (episodes, total_wins/args.threads, (end-last)/args.threads))
+        last = end
+        total_wins = 0
+        if episodes % 7 == 0:
+            save_model()
 
-  except KeyboardInterrupt:
-    pickle.dump(model, open('saveM.p', 'wb'))
-    print('saved multi-model')
-    break
+      except KeyboardInterrupt:
+        save_model()
+        break
 
-print('Done.')
+    print('Done.')
+    
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description='Train an agent to play pong')
+    parser.add_argument('--threads', '-t', default=8, type=int,
+                        help='Threads to run in parallel')
+    parser.add_argument('--games_per_thread', '-g', default=4, type=int,
+                        help='How many games to play per thread')
+    parser.add_argument('--paramsFile', '-p', default="saveM.p", 
+                        help='Parameter file to read/write from')
+    parser.parse_args(sys.argv[1:], args)
+    print('Param File is %s' % args.paramsFile)
+    train_agent()
+
+
