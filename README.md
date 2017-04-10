@@ -1,2 +1,2 @@
 # miscellaneous
-# Contains various scripts adapted from different sources
+Contains various scripts adapted from different sources
