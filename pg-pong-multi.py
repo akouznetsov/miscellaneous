@@ -15,6 +15,7 @@ learning_rate = 1e-3
 gamma = 0.99 # discount factor for reward
 decay_rate = 0.99 # decay factor for RMSProp leaky sum of grad^2
 total_wins = 0
+episodes = 0
 grad_buffer = {}
 rmsprop_cache = {}
 model = {}
@@ -22,11 +23,12 @@ model = {}
 # Parameter class
 class Args(object):
     threads = 8
-    games_per_thread = 4
+    batch_size = 20
     paramsFile = 'saveM.p'
 
 args = Args()
 env = gym.make("Pong-v0")
+lock = threading.RLock()
 
 def init_model():
     global model, grad_buffer, rmsprop_cache, H, D
@@ -89,9 +91,8 @@ def policy_backward(epx, eph, epdlogp):
 # Then, take the back prop and add them up from all processes and apply to model 
 def one_run(env, idx):
   """ Do one game set of play and learn from it """
-  global grad_buffer, total_wins, model
-  try:
-    for i in range(1, args.games_per_thread):
+  global grad_buffer, total_wins, model, episodes, lock
+  while True:
         observation = env.reset()
         prev_x = None # used in computing the difference frame
         xs,hs,dlogps,drs = [],[],[],[]
@@ -134,61 +135,60 @@ def one_run(env, idx):
 
         epdlogp *= discounted_epr # modulate the gradient with advantage (PG magic happens right here.)
         grad = policy_backward(epx, eph, epdlogp)
-        lock = threading.Lock()
-        lock.acquire()
+        lock.acquire(True)
         for k in model: grad_buffer[k] += grad[k] # accumulate grad over batch
         total_wins += 21 + reward_sum
+        episodes += 1
         lock.release()
         #print('Done with thread %d' % idx)
-  except KeyboardInterrupt:
-    raise
   
-def train_agent():
-    global model, total_wins, env
-    last = time.time()
-    episodes = 0
-    init_model()
+def sum_and_back_prop():
+    global last, episodes, lock, model, grad_buffer, rmsprop_cache
+    last_episode_processed = 0
     while True:
-      try:
-        thread_list = []
+        lock.acquire(True)
+        if episodes > last_episode_processed and (episodes % args.batch_size == 0):
+            last_episode_processed = episodes
+            for k,v in model.iteritems():
+              g = grad_buffer[k] # gradient
+              rmsprop_cache[k] = decay_rate * rmsprop_cache[k] + (1 - decay_rate) * g**2
+              model[k] += learning_rate * g / (np.sqrt(rmsprop_cache[k]) + 1e-5)
+              grad_buffer[k] = np.zeros_like(v) # reset batch gradient buffer
+
+            total_wins = 0
+            save_model()
+            # boring book-keeping
+            end = time.time()
+            print('episodes: %d, Av wins: %.2f, Ave time: %f ******' %
+                  (episodes, total_wins/args.batch_size, (end-last)/args.batch_size))
+            last = end
+            
+        lock.release()        
+
+def train_agent():
+    global env, last
+    last = time.time()
+    init_model()
+    thread_list = []
+    try:
         #print('*************Start %d threads' % args.threads)
-        for i in range(0, args.threads):
-          t = threading.Thread(target=one_run, args=(copy.deepcopy(env),i))
-          thread_list.append(t)
+        for i in range(args.threads):
+            t = threading.Thread(target=one_run, args=(copy.deepcopy(env),i))
+            t.setDaemon(True)
+            thread_list.append(t)
+        
+        # Run this thread to sum the values
+        t = threading.Thread(target=sum_and_back_prop)
+        t.setDaemon(True)
+        thread_list.append(t)
+        for t in thread_list:
           t.start()
           
-        #print('Wait for %d threads' % args.threads)
-        #Wait for all threads to finish
-        for t in thread_list:
-          #print('Joining thread %s' % t.getName())
-          #if(t.is_alive()):
-          t.join()
-
-        #print('Done waiting for %d threads' % args.threads)
-        for t in thread_list:
-          if(t.is_alive()):
-            print('Thread %s is still alive' % t.getName())
-            raise KeyboardInterrupt
+        while True:
+          time.sleep(1)
           
-        episodes += args.threads * args.games_per_thread
-        for k,v in model.iteritems():
-          g = grad_buffer[k] # gradient
-          rmsprop_cache[k] = decay_rate * rmsprop_cache[k] + (1 - decay_rate) * g**2
-          model[k] += learning_rate * g / (np.sqrt(rmsprop_cache[k]) + 1e-5)
-          grad_buffer[k] = np.zeros_like(v) # reset batch gradient buffer
-
-        # boring book-keeping
-        end = time.time()
-        print('episodes: %d, Av wins: %.2f, Ave time: %f ******' %
-              (episodes, total_wins/args.threads, (end-last)/args.threads))
-        last = end
-        total_wins = 0
-        if episodes % 7 == 0:
-            save_model()
-
-      except KeyboardInterrupt:
+    except KeyboardInterrupt:
         save_model()
-        break
 
     print('Done.')
     
@@ -196,7 +196,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Train an agent to play pong')
     parser.add_argument('--threads', '-t', default=8, type=int,
                         help='Threads to run in parallel')
-    parser.add_argument('--games_per_thread', '-g', default=4, type=int,
+    parser.add_argument('--batch_size', '-b', default=20, type=int,
                         help='How many games to play per thread')
     parser.add_argument('--paramsFile', '-p', default="saveM.p", 
                         help='Parameter file to read/write from')
