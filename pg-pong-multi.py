@@ -167,8 +167,8 @@ def sum_and_back_prop():
 
 def train_agent():
     global env, last
-    last = time.time()
     init_model()
+    last = time.time()
     thread_list = []
     try:
         #print('*************Start %d threads' % args.threads)
@@ -188,6 +188,7 @@ def train_agent():
           time.sleep(1)
           
     except KeyboardInterrupt:
+        lock.release()
         save_model()
 
     print('Done.')
