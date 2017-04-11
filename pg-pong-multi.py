@@ -14,7 +14,7 @@ D = 80 * 80 # input dimensionality: 80x80 grid
 learning_rate = 1e-3
 gamma = 0.99 # discount factor for reward
 decay_rate = 0.99 # decay factor for RMSProp leaky sum of grad^2
-total_wins = 0
+total_wins = 0.0
 episodes = 0
 grad_buffer = {}
 rmsprop_cache = {}
@@ -137,13 +137,13 @@ def one_run(env, idx):
         grad = policy_backward(epx, eph, epdlogp)
         lock.acquire(True)
         for k in model: grad_buffer[k] += grad[k] # accumulate grad over batch
-        total_wins += 21 + reward_sum
+        total_wins += 21.0 + reward_sum
         episodes += 1
         lock.release()
         #print('Done with thread %d' % idx)
   
 def sum_and_back_prop():
-    global last, episodes, lock, model, grad_buffer, rmsprop_cache
+    global last, episodes, lock, model, grad_buffer, rmsprop_cache, total_wins
     last_episode_processed = 0
     while True:
         lock.acquire(True)
@@ -155,12 +155,12 @@ def sum_and_back_prop():
               model[k] += learning_rate * g / (np.sqrt(rmsprop_cache[k]) + 1e-5)
               grad_buffer[k] = np.zeros_like(v) # reset batch gradient buffer
 
-            total_wins = 0
             save_model()
             # boring book-keeping
             end = time.time()
             print('episodes: %d, Av wins: %.2f, Ave time: %f ******' %
                   (episodes, total_wins/args.batch_size, (end-last)/args.batch_size))
+            total_wins = 0.0
             last = end
             
         lock.release()        
